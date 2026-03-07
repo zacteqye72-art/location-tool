@@ -1,0 +1,24 @@
+# 默认搜索配置
+search:
+  radius: 3000          # 搜索半径（米）
+  max_results: 20       # 每个数据源最大结果数
+  default_city: "北京"
+
+# 数据源开关
+sources:
+  amap: true
+  dianping: true
+  xiaohongshu: true
+
+# 排序权重
+ranking:
+  score_weight: 0.35     # 评分权重
+  distance_weight: 0.25  # 距离权重
+  price_weight: 0.15     # 价格匹配权重
+  review_weight: 0.15    # 评论数权重
+  preference_weight: 0.10 # 偏好匹配权重
+
+# LLM 配置
+llm:
+  model: "gpt-5.4"
+  max_tokens: 2048
