@@ -18,10 +18,10 @@ class SearchEngine:
         self.amap = AmapClient(config)
         self._sources: list[DataSource] = []
 
-        if config.sources.dianping:
-            self._sources.append(DianpingSource())
-        if config.sources.xiaohongshu:
-            self._sources.append(XiaohongshuSource())
+        if config.sources.dianping and config.openai_api_key:
+            self._sources.append(DianpingSource(config))
+        if config.sources.xiaohongshu and config.openai_api_key:
+            self._sources.append(XiaohongshuSource(config))
 
     async def close(self):
         await self.amap.close()

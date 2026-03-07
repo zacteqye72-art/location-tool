@@ -329,21 +329,30 @@ def chat():
         conversation.append({"role": "user", "content": user_input})
         conversation.append({"role": "assistant", "content": reply})
 
-        # 检查是否有搜索意图
+        # 检查是否有搜索意图 [SEARCH:关键词|城市|人均最低|人均最高]
         search_match = re.search(r"\[SEARCH:(.+?)\]", reply)
         if search_match:
-            search_term = search_match.group(1)
+            search_tag = search_match.group(1)
             clean_reply = reply.replace(search_match.group(0), "").strip()
             console.print(f"[bold]助手>[/bold] {clean_reply}\n")
 
-            # 自动触发搜索
-            console.print(f"[dim]🔍 自动搜索: {search_term}[/dim]")
+            # 解析搜索参数
+            parts = [p.strip() for p in search_tag.split("|")]
+            keyword = parts[0] if len(parts) > 0 else "餐厅"
+            city = parts[1] if len(parts) > 1 and parts[1] else config.search.default_city
+            price_min = float(parts[2]) if len(parts) > 2 and parts[2] and parts[2] != "0" else 0
+            price_max = float(parts[3]) if len(parts) > 3 and parts[3] and parts[3] != "0" else 0
+
+            console.print(f"[dim]🔍 搜索: {keyword} | 城市: {city} | 人均: {f'¥{price_min:.0f}-{price_max:.0f}' if price_max else '不限'}[/dim]")
 
             async def _auto_search():
                 sq = SearchQuery(
-                    keyword=search_term,
-                    city=config.search.default_city,
+                    keyword=keyword,
+                    cuisine=keyword,
+                    city=city,
                     radius=config.search.radius,
+                    price_min=price_min,
+                    price_max=price_max,
                 )
                 loc = _load_location()
                 if loc:
@@ -360,7 +369,18 @@ def chat():
                 results = ranker.rank(results, sq, profile.get_preference_tags())
                 _display_results(results)
 
-                record = SearchRecord(query=search_term, results_count=len(results))
+                # LLM 推荐
+                if results and config.openai_api_key:
+                    top = [
+                        {"name": r.name, "cuisine": r.cuisine, "score": r.score,
+                         "price": r.price_per_person, "distance": r.distance}
+                        for r in results[:5]
+                    ]
+                    with console.status("💡 生成推荐..."):
+                        rec = llm.recommend(top, f"{keyword} {city}")
+                    console.print(Panel(rec, title="推荐", border_style="green"))
+
+                record = SearchRecord(query=f"{keyword}({city})", results_count=len(results))
                 profile.add_history(record)
 
             _run(_auto_search())

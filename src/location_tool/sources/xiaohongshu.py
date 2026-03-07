@@ -1,117 +1,98 @@
-"""小红书数据源（搜索笔记提取餐厅推荐）"""
+"""小红书数据源 — 通过 OpenAI web_search 获取笔记推荐"""
 
 from __future__ import annotations
 
+import json
 import re
 
-import httpx
-from bs4 import BeautifulSoup
+from openai import OpenAI
 
+from location_tool.config import Config
 from location_tool.models import Restaurant, SearchQuery
 from location_tool.sources.base import DataSource
 
-MOBILE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-        "Version/17.0 Mobile/15E148 Safari/604.1"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-}
 
-SEARCH_URL = "https://www.xiaohongshu.com/search_result"
+def _extract_json_array(text: str) -> list[dict]:
+    """从 LLM 返回的文本中提取 JSON 数组"""
+    m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
+    if m:
+        text = m.group(1)
+    start = text.find("[")
+    if start == -1:
+        return []
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "[":
+            depth += 1
+        elif text[i] == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    return []
+    return []
 
 
 class XiaohongshuSource(DataSource):
     name = "xiaohongshu"
 
-    def __init__(self):
-        self._client = httpx.AsyncClient(
-            timeout=15,
-            headers=MOBILE_HEADERS,
-            follow_redirects=True,
-        )
-        self.extra_cookies: dict[str, str] = {}
-
-    async def close(self):
-        await self._client.aclose()
+    def __init__(self, config: Config):
+        self.config = config
+        self.client = OpenAI(api_key=config.openai_api_key)
 
     async def search(self, query: SearchQuery) -> list[Restaurant]:
         keyword = query.keyword or query.cuisine or "餐厅"
-        search_term = f"{query.city}{keyword}推荐" if query.city else f"{keyword}推荐"
+        city = query.city or "北京"
+        price_hint = ""
+        if query.price_min or query.price_max:
+            price_hint = f"，人均{query.price_min or '?'}-{query.price_max or '?'}元"
+
+        prompt = f"""搜索小红书上关于 {city}「{keyword}」餐厅的推荐笔记{price_hint}，提取被推荐最多的 10 家餐厅。
+
+返回 JSON 数组，每个元素包含：
+- name: 餐厅名
+- cuisine: 菜系
+- score: 推荐程度（1-5，根据笔记数量和评价估算）
+- price_per_person: 人均消费（数字，没有则 0）
+- address: 地址（如有）
+- tags: 标签数组（如 ["网红店", "拍照好看", "氛围感"]）
+- highlights: 小红书博主的推荐理由数组（1-2条）
+
+只返回 JSON 数组，不要其他内容。"""
 
         try:
-            resp = await self._client.get(
-                SEARCH_URL,
-                params={"keyword": search_term, "source": "web_search_result_notes"},
-                cookies=self.extra_cookies,
+            resp = self.client.responses.create(
+                model=self.config.llm.model,
+                tools=[{"type": "web_search_preview"}],
+                input=prompt,
             )
-            resp.raise_for_status()
-        except httpx.HTTPError:
+
+            text = ""
+            for item in resp.output:
+                if item.type == "message":
+                    for block in item.content:
+                        if block.type == "output_text":
+                            text = block.text
+                            break
+
+            if not text:
+                return []
+
+            data = _extract_json_array(text)
+            return [self._parse(item) for item in data if isinstance(item, dict)]
+        except Exception:
             return []
 
-        return self._parse_results(resp.text)
-
-    def _parse_results(self, html: str) -> list[Restaurant]:
-        soup = BeautifulSoup(html, "html.parser")
-        restaurants: list[Restaurant] = []
-
-        # 小红书搜索结果以笔记卡片展示
-        cards = soup.select(".note-item, [class*='note-card'], [class*='search-item']")
-        for card in cards[:15]:
-            try:
-                items = self._extract_restaurants_from_card(card)
-                restaurants.extend(items)
-            except Exception:
-                continue
-
-        return restaurants
-
-    def _extract_restaurants_from_card(self, card) -> list[Restaurant]:
-        """从笔记卡片中提取餐厅信息"""
-        results: list[Restaurant] = []
-
-        title_el = card.select_one(".title, h3, [class*='title']")
-        desc_el = card.select_one(".desc, .content, [class*='desc']")
-
-        title = title_el.get_text(strip=True) if title_el else ""
-        desc = desc_el.get_text(strip=True) if desc_el else ""
-        full_text = f"{title} {desc}"
-
-        if not full_text.strip():
-            return results
-
-        # 从文本中提取可能的餐厅名（常见模式：「店名」、【店名】、《店名》）
-        bracket_names = re.findall(r"[「【《](.+?)[」】》]", full_text)
-
-        # 提取人均价格
-        price_match = re.search(r"人均[：:]?\s*(\d+)", full_text)
-        price = float(price_match.group(1)) if price_match else 0
-
-        # 提取评分
-        score_match = re.search(r"(\d+\.?\d*)\s*分", full_text)
-        score = float(score_match.group(1)) if score_match else 0
-        if score > 5:
-            score = score / 2  # 归一化到 5 分制
-
-        if bracket_names:
-            for name in bracket_names[:3]:
-                results.append(Restaurant(
-                    name=name,
-                    score=score,
-                    price_per_person=price,
-                    source="xiaohongshu",
-                    highlights=[title] if title else [],
-                ))
-        elif title:
-            # 标题本身可能就是餐厅推荐
-            results.append(Restaurant(
-                name=title,
-                score=score,
-                price_per_person=price,
-                source="xiaohongshu",
-                highlights=[desc[:100]] if desc else [],
-            ))
-
-        return results
+    @staticmethod
+    def _parse(item: dict) -> Restaurant:
+        return Restaurant(
+            name=item.get("name") or "",
+            cuisine=item.get("cuisine") or "",
+            score=float(item.get("score") or 0),
+            price_per_person=float(item.get("price_per_person") or 0),
+            address=item.get("address") or "",
+            source="xiaohongshu",
+            tags=item.get("tags") or [],
+            highlights=item.get("highlights") or [],
+        )

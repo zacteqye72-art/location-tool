@@ -81,6 +81,7 @@ class AmapClient:
             "radius": radius,
             "offset": max_results,
             "sortrule": "weight",
+            "extensions": "all",
         })
         return [self._parse_poi(poi) for poi in data.get("pois", [])]
 
@@ -97,6 +98,7 @@ class AmapClient:
             "types": "050000",
             "offset": max_results,
             "citylimit": "true",
+            "extensions": "all",
         })
         return [self._parse_poi(poi) for poi in data.get("pois", [])]
 
@@ -109,17 +111,42 @@ class AmapClient:
         biz = poi.get("biz_ext", {})
         cost = biz.get("cost") if biz else None
 
+        # 从 tag/atag 提取推荐菜等标签
+        tag_str = poi.get("tag", "") or poi.get("atag", "")
+        extra_tags = [t.strip() for t in tag_str.split(",") if t.strip()] if isinstance(tag_str, str) else []
+
+        # 营业时间
+        open_time = ""
+        if biz:
+            open_time = biz.get("opentime2", "") or biz.get("open_time", "")
+
+        # 商圈
+        business_area = poi.get("business_area", "")
+        if isinstance(business_area, list):
+            business_area = ""
+
+        highlights = []
+        if extra_tags:
+            highlights.append(f"推荐: {', '.join(extra_tags[:5])}")
+        if open_time:
+            highlights.append(f"营业: {open_time}")
+        if business_area:
+            highlights.append(f"商圈: {business_area}")
+
+        type_tags = poi.get("type", "").split(";") if poi.get("type") else []
+
         return Restaurant(
             name=poi.get("name", ""),
             location=loc,
-            cuisine=poi.get("type", "").split(";")[-1] if poi.get("type") else "",
+            cuisine=type_tags[-1] if type_tags else "",
             score=float(biz.get("rating", 0)) if biz and biz.get("rating") else 0,
             price_per_person=float(cost) if cost else 0,
             phone=poi.get("tel", ""),
             address=poi.get("address", "") if isinstance(poi.get("address"), str) else "",
             source="amap",
             distance=float(poi.get("distance", 0)),
-            tags=poi.get("type", "").split(";") if poi.get("type") else [],
+            tags=type_tags + extra_tags[:5],
+            highlights=highlights,
             raw_data=poi,
         )
 
