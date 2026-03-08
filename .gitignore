@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 data/preferences.json
 data/history.json
+data/browser_profile/
 dist/
 *.egg-info/
 *.DS_Store

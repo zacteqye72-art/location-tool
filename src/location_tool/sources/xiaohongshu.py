@@ -1,37 +1,20 @@
-"""小红书数据源 — 通过 OpenAI web_search 获取笔记推荐"""
+"""小红书数据源 — Playwright 浏览器爬取笔记推荐"""
 
 from __future__ import annotations
 
-import json
 import re
-
-from openai import OpenAI
 
 from location_tool.config import Config
 from location_tool.models import Restaurant, SearchQuery
 from location_tool.sources.base import DataSource
+from location_tool.browser import BrowserManager, random_delay
 
 
-def _extract_json_array(text: str) -> list[dict]:
-    """从 LLM 返回的文本中提取 JSON 数组"""
-    m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
-    if m:
-        text = m.group(1)
-    start = text.find("[")
-    if start == -1:
-        return []
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "[":
-            depth += 1
-        elif text[i] == "]":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start:i + 1])
-                except json.JSONDecodeError:
-                    return []
-    return []
+# 从笔记标题/正文提取餐厅名的常见模式
+_RESTAURANT_PATTERN = re.compile(
+    r"[「《【]([^」》】]{2,20})[」》】]"  # 书名号/括号括起来的名称
+    r"|(?:推荐|安利|打卡|必吃|探店)[：:]?\s*([^\s,，。！!]{2,15})"  # "推荐xxx"
+)
 
 
 class XiaohongshuSource(DataSource):
@@ -39,60 +22,152 @@ class XiaohongshuSource(DataSource):
 
     def __init__(self, config: Config):
         self.config = config
-        self.client = OpenAI(api_key=config.openai_api_key)
 
     async def search(self, query: SearchQuery) -> list[Restaurant]:
         keyword = query.keyword or query.cuisine or "餐厅"
         city = query.city or "北京"
-        price_hint = ""
-        if query.price_min or query.price_max:
-            price_hint = f"，人均{query.price_min or '?'}-{query.price_max or '?'}元"
-
-        prompt = f"""搜索小红书上关于 {city}「{keyword}」餐厅的推荐笔记{price_hint}，提取被推荐最多的 10 家餐厅。
-
-返回 JSON 数组，每个元素包含：
-- name: 餐厅名
-- cuisine: 菜系
-- score: 推荐程度（1-5，根据笔记数量和评价估算）
-- price_per_person: 人均消费（数字，没有则 0）
-- address: 地址（如有）
-- tags: 标签数组（如 ["网红店", "拍照好看", "氛围感"]）
-- highlights: 小红书博主的推荐理由数组（1-2条）
-
-只返回 JSON 数组，不要其他内容。"""
+        search_term = f"{city} {keyword} 餐厅推荐"
 
         try:
-            resp = self.client.responses.create(
-                model=self.config.llm.model,
-                tools=[{"type": "web_search_preview"}],
-                input=prompt,
-            )
-
-            text = ""
-            for item in resp.output:
-                if item.type == "message":
-                    for block in item.content:
-                        if block.type == "output_text":
-                            text = block.text
-                            break
-
-            if not text:
-                return []
-
-            data = _extract_json_array(text)
-            return [self._parse(item) for item in data if isinstance(item, dict)]
+            bm = await BrowserManager.get()
+            page = await bm.new_page()
         except Exception:
             return []
 
+        try:
+            search_url = (
+                f"https://www.xiaohongshu.com/search_result?"
+                f"keyword={search_term}&type=1"
+            )
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
+            await random_delay(1.5, 2.5)
+
+            # 检测登录墙
+            if await self._is_blocked(page):
+                return []
+
+            # 等待笔记列表加载
+            try:
+                await page.wait_for_selector(
+                    ".note-item, .feeds-page .note-item, section.note-item",
+                    timeout=8000,
+                )
+            except Exception:
+                pass
+
+            await random_delay(0.5, 1.0)
+
+            # 提取笔记卡片信息
+            notes = await page.evaluate("""() => {
+                const results = [];
+                const items = document.querySelectorAll(
+                    '.note-item, section.note-item, .feeds-page .note-item, [data-v-a264b01a]'
+                );
+                items.forEach(item => {
+                    try {
+                        const titleEl = item.querySelector(
+                            '.title, .note-title, .desc, a.title span, .footer .title'
+                        );
+                        const title = titleEl ? titleEl.textContent.trim() : '';
+
+                        const descEl = item.querySelector(
+                            '.desc, .note-desc, .content'
+                        );
+                        const desc = descEl ? descEl.textContent.trim() : '';
+
+                        const likesEl = item.querySelector(
+                            '.like-count, .count, .like-wrapper span, [data-v-like]'
+                        );
+                        let likes = 0;
+                        if (likesEl) {
+                            const lm = likesEl.textContent.match(/(\\d+)/);
+                            if (lm) likes = parseInt(lm[1]);
+                        }
+
+                        if (title || desc) {
+                            results.push({ title, desc, likes });
+                        }
+                    } catch(e) {}
+                });
+                return results.slice(0, 20);
+            }""")
+
+            # 从笔记标题/描述中用正则提取餐厅名
+            restaurant_counts: dict[str, dict] = {}
+            for note in notes:
+                text = f"{note.get('title', '')} {note.get('desc', '')}"
+                names = self._extract_restaurant_names(text)
+                likes = note.get("likes", 0)
+                for name in names:
+                    if name not in restaurant_counts:
+                        restaurant_counts[name] = {
+                            "mentions": 0,
+                            "total_likes": 0,
+                            "highlights": [],
+                        }
+                    restaurant_counts[name]["mentions"] += 1
+                    restaurant_counts[name]["total_likes"] += likes
+                    title = note.get("title", "")
+                    if title and len(restaurant_counts[name]["highlights"]) < 2:
+                        restaurant_counts[name]["highlights"].append(title)
+
+            # 按提及次数排序，转为 Restaurant
+            sorted_names = sorted(
+                restaurant_counts.items(),
+                key=lambda x: (x[1]["mentions"], x[1]["total_likes"]),
+                reverse=True,
+            )
+
+            restaurants = []
+            for name, info in sorted_names[:10]:
+                # 根据提及次数估算推荐度 (1-5)
+                mentions = info["mentions"]
+                score = min(5.0, 1.0 + mentions * 0.8)
+
+                restaurants.append(Restaurant(
+                    name=name,
+                    cuisine=keyword if keyword != "餐厅" else "",
+                    score=score,
+                    source="xiaohongshu",
+                    tags=["小红书推荐"],
+                    highlights=[
+                        f"被 {mentions} 篇笔记提及"
+                    ] + info["highlights"][:1],
+                ))
+
+            return restaurants
+
+        except Exception:
+            return []
+        finally:
+            await page.close()
+
+    async def _is_blocked(self, page) -> bool:
+        """检测是否被登录墙拦截"""
+        url = page.url
+        if "login" in url or "passport" in url:
+            return True
+        try:
+            login_modal = await page.query_selector(
+                ".login-container, .captcha-container, #captcha"
+            )
+            if login_modal:
+                return True
+        except Exception:
+            pass
+        return False
+
     @staticmethod
-    def _parse(item: dict) -> Restaurant:
-        return Restaurant(
-            name=item.get("name") or "",
-            cuisine=item.get("cuisine") or "",
-            score=float(item.get("score") or 0),
-            price_per_person=float(item.get("price_per_person") or 0),
-            address=item.get("address") or "",
-            source="xiaohongshu",
-            tags=item.get("tags") or [],
-            highlights=item.get("highlights") or [],
-        )
+    def _extract_restaurant_names(text: str) -> list[str]:
+        """从笔记文本中用正则提取餐厅名"""
+        names = []
+        for m in _RESTAURANT_PATTERN.finditer(text):
+            name = m.group(1) or m.group(2)
+            if name:
+                name = name.strip()
+                # 过滤太短或明显不是餐厅名的
+                if len(name) >= 2 and not any(
+                    w in name for w in ("小红书", "笔记", "合集", "攻略", "总结", "分享")
+                ):
+                    names.append(name)
+        return names

@@ -297,6 +297,39 @@ def history(
 
 
 @app.command()
+def login(
+    platform: str = typer.Argument(
+        ..., help="平台名称：dianping 或 xiaohongshu"
+    ),
+):
+    """打开浏览器手动登录平台，保存 cookie"""
+    urls = {
+        "dianping": "https://www.dianping.com",
+        "xiaohongshu": "https://www.xiaohongshu.com",
+    }
+    if platform not in urls:
+        console.print(f"[red]不支持的平台: {platform}，可选: dianping, xiaohongshu[/red]")
+        raise typer.Exit(1)
+
+    async def _do():
+        from location_tool.browser import BrowserManager
+        bm = await BrowserManager.get()
+        page = await bm.open_for_login(urls[platform])
+        console.print(f"[green]浏览器已打开 {platform}，请手动登录。[/green]")
+        console.print("[dim]登录完成后按 Enter 键关闭浏览器并保存 cookie...[/dim]")
+
+        try:
+            input()  # 阻塞等待用户按回车
+        except (KeyboardInterrupt, EOFError):
+            pass
+
+        await bm.close()
+        console.print(f"[green]cookie 已保存，后续搜索将自动使用登录态。[/green]")
+
+    _run(_do())
+
+
+@app.command()
 def chat():
     """进入对话模式，自然语言交互"""
     config = load_config()

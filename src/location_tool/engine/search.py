@@ -18,15 +18,20 @@ class SearchEngine:
         self.amap = AmapClient(config)
         self._sources: list[DataSource] = []
 
-        if config.sources.dianping and config.openai_api_key:
+        if config.sources.dianping:
             self._sources.append(DianpingSource(config))
-        if config.sources.xiaohongshu and config.openai_api_key:
+        if config.sources.xiaohongshu:
             self._sources.append(XiaohongshuSource(config))
 
     async def close(self):
         await self.amap.close()
         for src in self._sources:
             await src.close()
+        # 清理浏览器资源
+        if self._sources:
+            from location_tool.browser import BrowserManager
+            bm = await BrowserManager.get()
+            await bm.close()
 
     async def search(self, query: SearchQuery) -> list[Restaurant]:
         """并发搜索所有数据源，合并去重"""
